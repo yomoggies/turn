@@ -5,9 +5,11 @@ package turn
 
 import (
 	b64 "encoding/base64"
+	"errors"
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -409,6 +411,23 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol) ( //nolint:cyclop
 	if res.Type.Class == stun.ClassErrorResponse {
 		var code stun.ErrorCodeAttribute
 		if err = code.GetFrom(res); err == nil {
+			if code.Code == stun.CodeTryAlternate {
+				e := &TryAlternateError{}
+				if err := e.AlternateServer.GetFrom(res); err != nil {
+					return relayed, lifetime, nonce, reservationToken, fmt.Errorf("parse ALTERNATE-SERVER in 300 Try Alternate error response: %w", err)
+				}
+				addrPort, ok := c.turnServerAddr.(interface {
+					AddrPort() netip.AddrPort
+				})
+				if !ok {
+					return relayed, lifetime, nonce, reservationToken, fmt.Errorf("source IP address is not comparable: netip.AddrPort is not implemented on %T", c.turnServerAddr)
+				}
+				if addrPort.AddrPort().Addr().Is4() == (e.AlternateServer.IP.To4() != nil) {
+					return relayed, lifetime, nonce, reservationToken, errors.New("ALTERNATE-SERVER IP address has a mismatched source IP address family")
+				}
+				return relayed, lifetime, nonce, reservationToken, e
+			}
+
 			turnError := &stun.TurnError{
 				StunMessageType: res.Type,
 				ErrorCodeAttr:   code,
@@ -438,6 +457,23 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol) ( //nolint:cyclop
 	}
 
 	return relayed, lifetime, nonce, reservationToken, nil
+}
+
+// TryAlternateError is returned when a TURN allocation request receives a STUN
+// error response with code 300 (Try Alternate).
+//
+// The error indicates that the client should retry the allocation against a
+// different TURN server.
+type TryAlternateError struct {
+	// AlternateServer is the STUN ALTERNATE-SERVER attribute carried in the
+	// error response. It specifies the IP address (in the same address family
+	// as the current TURN connection) of the alternate server to connect.
+	AlternateServer stun.AlternateServer
+}
+
+// Error returns a string representation for TryAlternateError.
+func (e *TryAlternateError) Error() string {
+	return fmt.Sprintf("300 Try Alternate error response: %s:%d", e.AlternateServer.IP, e.AlternateServer.Port)
 }
 
 // Allocate sends a TURN allocation request to the given transport address.
